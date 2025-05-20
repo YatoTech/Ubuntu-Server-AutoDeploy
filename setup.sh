@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Professional Auto-Deploy Server Setup Script
+# Ultimate Auto-Deploy Server Setup with Nuclear-Grade Error Handling
 # Author: Yatogami
-# Version: 2.0
-# Description: Complete server deployment with nuclear-grade error handling
+# Version: 3.0
+# Description: Enterprise-grade deployment system with self-healing capabilities
 
 # --------------------------
-# Configuration
+# Global Configuration
 # --------------------------
 CURRENT_IP=$(hostname -I | awk '{print $1}')
 DEFAULT_DOMAIN="yatogami.net"
@@ -17,10 +17,16 @@ WEB_PORT=3000
 NGINX_PORT=80
 NGINX_SSL_PORT=443
 LOG_FILE="/var/log/auto-deploy-$(date +%Y%m%d%H%M%S).log"
-MAX_RETRIES=3
-RETRY_DELAY=5
+MAX_RETRIES=5
+RETRY_DELAY=10
 BACKUP_DIR="/var/backups/auto-deploy-$(date +%Y%m%d%H%M%S)"
 TEMP_DIR=$(mktemp -d)
+DEPENDENCIES=(
+    curl wget git htop nano ufw fail2ban unattended-upgrades
+    nginx docker.io docker-compose jq net-tools openssl
+    python3-certbot-nginx apt-transport-https ca-certificates
+    software-properties-common gnupg-agent
+)
 
 # --------------------------
 # Initialization
@@ -51,6 +57,7 @@ log() {
         "WARN") echo -e "${YELLOW}[${timestamp}] WARN: ${message}${NC}" ;;
         "ERROR") echo -e "${RED}[${timestamp}] ERROR: ${message}${NC}" ;;
         "DEBUG") echo -e "${BLUE}[${timestamp}] DEBUG: ${message}${NC}" ;;
+        "CRITICAL") echo -e "${MAGENTA}[${timestamp}] CRITICAL: ${message}${NC}" ;;
         *) echo -e "[${timestamp}] ${message}" ;;
     esac
 }
@@ -59,22 +66,31 @@ create_backup() {
     local target=$1
     log "INFO" "Creating backup of ${target}"
     mkdir -p "${BACKUP_DIR}"
-    cp -r "${target}" "${BACKUP_DIR}/" || {
-        log "WARN" "Failed to backup ${target}"
-        return 1
-    }
+    
+    if [ -d "$target" ] || [ -f "$target" ]; then
+        cp -r "${target}" "${BACKUP_DIR}/" || {
+            log "WARN" "Failed to backup ${target}"
+            return 1
+        }
+    else
+        log "DEBUG" "Backup target ${target} does not exist"
+        return 2
+    fi
 }
 
 retry_command() {
     local cmd=$1
     local description=$2
-    local max_retries=$MAX_RETRIES
-    local retry_delay=$RETRY_DELAY
+    local max_retries=${3:-$MAX_RETRIES}
+    local retry_delay=${4:-$RETRY_DELAY}
     local exit_code=0
+    local attempt=1
 
-    for ((i=1; i<=max_retries; i++)); do
-        log "INFO" "Attempt ${i}/${max_retries}: ${description}"
-        eval "$cmd"
+    while [ $attempt -le $max_retries ]; do
+        log "INFO" "Attempt ${attempt}/${max_retries}: ${description}"
+        
+        # Execute command with error capture
+        eval "$cmd" 2>&1
         exit_code=$?
         
         if [ $exit_code -eq 0 ]; then
@@ -82,11 +98,13 @@ retry_command() {
             return 0
         fi
         
-        if [ $i -lt $max_retries ]; then
-            log "WARN" "${description} failed, retrying in ${retry_delay}s..."
+        if [ $attempt -lt $max_retries ]; then
+            log "WARN" "${description} failed (Code: ${exit_code}), retrying in ${retry_delay}s..."
             sleep $retry_delay
             retry_delay=$((retry_delay * 2)) # Exponential backoff
         fi
+        
+        attempt=$((attempt + 1))
     done
 
     log "ERROR" "${description} failed after ${max_retries} attempts"
@@ -96,85 +114,132 @@ retry_command() {
 verify_dependency() {
     local dep=$1
     if ! command -v "$dep" &> /dev/null; then
-        log "ERROR" "Missing dependency: ${dep}"
+        log "WARN" "Missing dependency: ${dep}"
         return 1
     fi
     return 0
 }
 
+emergency_cleanup() {
+    log "CRITICAL" "Initiating emergency cleanup..."
+    
+    # Stop all containers
+    docker ps -aq | xargs -r docker stop || log "WARN" "Failed to stop containers"
+    
+    # Restore Nginx config if backup exists
+    if [ -d "${BACKUP_DIR}/nginx" ]; then
+        log "INFO" "Restoring Nginx configuration"
+        rm -rf /etc/nginx/*
+        cp -r "${BACKUP_DIR}/nginx"/* /etc/nginx/ || log "WARN" "Failed to restore Nginx config"
+    fi
+    
+    # Restart services
+    systemctl restart nginx || log "WARN" "Failed to restart Nginx"
+    systemctl restart docker || log "WARN" "Failed to restart Docker"
+    
+    log "CRITICAL" "Emergency cleanup completed"
+    exit 1
+}
+
 # --------------------------
-# Setup Functions
+# Setup Functions with Enhanced Error Handling
 # --------------------------
 
 system_update() {
     log "INFO" "Starting system update..."
     
-    retry_command "apt-get update" "Update package lists" || {
-        log "WARN" "Continuing with potentially stale package lists"
-    }
+    local update_cmds=(
+        "apt-get update"
+        "apt-get upgrade -y"
+        "apt-get dist-upgrade -y"
+        "apt-get autoremove -y"
+    )
     
-    retry_command "apt-get upgrade -y" "Upgrade packages" || {
-        log "WARN" "System upgrade partially completed"
-    }
-    
-    retry_command "apt-get dist-upgrade -y" "Distribution upgrade" || {
-        log "WARN" "Distribution upgrade partially completed"
-    }
-    
-    retry_command "apt-get autoremove -y" "Remove unused packages" || {
-        log "WARN" "Could not clean all unused packages"
-    }
+    for cmd in "${update_cmds[@]}"; do
+        retry_command "$cmd" "System update step: $cmd" 3 5 || {
+            log "WARN" "System update partially completed"
+            return 1
+        }
+    done
     
     log "INFO" "System update completed"
+    return 0
 }
 
 install_essentials() {
     log "INFO" "Installing essential packages..."
     
-    local packages=(
-        curl wget git htop nano ufw fail2ban unattended-upgrades
-        nginx docker.io docker-compose jq net-tools openssl
-        python3-certbot-nginx apt-transport-https ca-certificates
-        software-properties-common gnupg-agent
-    )
+    # First attempt with all packages
+    if ! retry_command "apt-get install -y ${DEPENDENCIES[*]}" "Install all packages"; then
+        log "WARN" "Bulk installation failed, trying individual packages..."
+        
+        # Install packages one by one
+        for pkg in "${DEPENDENCIES[@]}"; do
+            if dpkg -l | grep -q "^ii  ${pkg} "; then
+                log "DEBUG" "Package ${pkg} already installed"
+                continue
+            fi
+            
+            if ! retry_command "apt-get install -y ${pkg}" "Install ${pkg}" 2 5; then
+                log "WARN" "Failed to install ${pkg}, trying with --fix-broken..."
+                apt-get install -y --fix-broken "${pkg}" || {
+                    log "ERROR" "Critical failure installing ${pkg}"
+                    emergency_cleanup
+                }
+            fi
+        done
+    fi
     
-    for pkg in "${packages[@]}"; do
-        if dpkg -l | grep -q "^ii  ${pkg} "; then
-            log "INFO" "Package ${pkg} already installed"
-            continue
+    # Docker service management with multiple fallbacks
+    if ! systemctl is-active --quiet docker; then
+        log "INFO" "Configuring Docker service..."
+        
+        if ! retry_command "systemctl enable docker" "Enable Docker service"; then
+            log "WARN" "Standard enable failed, trying alternative method..."
+            systemctl unmask docker
+            systemctl enable docker || {
+                log "ERROR" "Cannot enable Docker service"
+                emergency_cleanup
+            }
         fi
         
-        retry_command "apt-get install -y ${pkg}" "Install ${pkg}" || {
-            log "WARN" "Failed to install ${pkg}, trying with --fix-broken..."
-            apt-get install -y --fix-broken "${pkg}" || {
-                log "WARN" "Could not install ${pkg}, skipping..."
-                continue
+        if ! retry_command "systemctl start docker" "Start Docker service"; then
+            log "WARN" "Standard start failed, trying alternative method..."
+            systemctl daemon-reload
+            systemctl restart docker || {
+                log "ERROR" "Cannot start Docker service"
+                emergency_cleanup
             }
-        }
-    done
-    
-    # Docker service management
-    retry_command "systemctl enable docker" "Enable Docker service" || {
-        log "WARN" "Could not enable Docker service"
-    }
-    
-    retry_command "systemctl start docker" "Start Docker service" || {
-        log "WARN" "Could not start Docker service"
-    }
+        fi
+    fi
     
     log "INFO" "Essential packages installation completed"
+    return 0
 }
 
 setup_webapp() {
     log "INFO" "Setting up web application..."
     
-    # Create directory structure
-    mkdir -p webapp/{public/{css,js,uploads},views} || {
-        log "ERROR" "Failed to create webapp directories"
-        return 1
-    }
+    # Create directory structure with validation
+    local dirs=(
+        "webapp"
+        "webapp/public"
+        "webapp/public/css"
+        "webapp/public/js"
+        "webapp/public/uploads"
+        "webapp/views"
+    )
     
-    # package.json
+    for dir in "${dirs[@]}"; do
+        if [ ! -d "$dir" ]; then
+            mkdir -p "$dir" || {
+                log "ERROR" "Failed to create directory: ${dir}"
+                emergency_cleanup
+            }
+        fi
+    done
+    
+    # Generate package.json with validation
     cat > webapp/package.json <<EOL
 {
   "name": "auto-deploy-web",
@@ -196,7 +261,12 @@ setup_webapp() {
 }
 EOL
 
-    # server.js with enhanced error handling
+    [ -s "webapp/package.json" ] || {
+        log "ERROR" "Failed to create package.json"
+        emergency_cleanup
+    }
+
+    # Generate server.js with enhanced error handling
     cat > webapp/server.js <<EOL
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -206,70 +276,112 @@ const fs = require('fs-extra');
 const multer = require('multer');
 require('dotenv').config();
 
-// Initialize app
+// Initialize app with enhanced error handling
 const app = express();
-const docker = new Docker();
-
-// Configure file uploads
-const upload = multer({
-    dest: path.join(__dirname, 'public/uploads'),
-    limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
+const docker = new Docker({
+    socketPath: '/var/run/docker.sock',
+    timeout: 3000
 });
 
-// Middleware
-app.use(bodyParser.urlencoded({ extended: true }));
+// Configure file uploads with limits
+const upload = multer({
+    dest: path.join(__dirname, 'public/uploads'),
+    limits: {
+        fileSize: 100 * 1024 * 1024, // 100MB
+        files: 1
+    }
+});
+
+// Middleware with error handling
+app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
-// Authentication middleware
+// Enhanced authentication middleware
 const authenticate = (req, res, next) => {
     try {
         const authHeader = req.headers.authorization;
         if (!authHeader) {
-            return res.status(401).set('WWW-Authenticate', 'Basic').send();
+            res.set('WWW-Authenticate', 'Basic realm="Authorization Required"');
+            return res.status(401).json({ error: 'Authentication required' });
         }
 
-        const [user, pass] = Buffer.from(authHeader.split(' ')[1], 'base64')
+        const credentials = Buffer.from(authHeader.split(' ')[1], 'base64')
             .toString()
             .split(':');
 
-        if (user !== process.env.ADMIN_USER || pass !== process.env.ADMIN_PASS) {
-            return res.status(403).send('Forbidden');
+        if (credentials.length !== 2 || 
+            credentials[0] !== process.env.ADMIN_USER || 
+            credentials[1] !== process.env.ADMIN_PASS) {
+            return res.status(403).json({ error: 'Invalid credentials' });
         }
 
         next();
     } catch (err) {
         console.error('Authentication error:', err);
-        res.status(500).send('Authentication failed');
+        res.status(500).json({ error: 'Authentication processing failed' });
     }
 };
 
-// Routes
-app.get('/', authenticate, (req, res) => {
-    res.render('index', { 
-        domain: process.env.DOMAIN,
-        ip: process.env.CURRENT_IP
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.status(200).json({ 
+        status: 'healthy',
+        timestamp: new Date().toISOString()
     });
 });
 
+// Main application routes
+app.get('/', authenticate, (req, res) => {
+    try {
+        res.render('index', { 
+            domain: process.env.DOMAIN,
+            ip: process.env.CURRENT_IP,
+            version: '1.0.0'
+        });
+    } catch (err) {
+        console.error('Render error:', err);
+        res.status(500).send('Internal Server Error');
+    }
+});
+
+// File upload endpoint with validation
 app.post('/deploy', authenticate, upload.single('website'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ error: 'No file uploaded' });
         }
 
-        const targetPath = path.join(__dirname, 'public/deployments', req.file.originalname);
+        // Validate file extension
+        const allowedExtensions = ['.zip', '.tar', '.gz'];
+        const fileExt = path.extname(req.file.originalname).toLowerCase();
+        
+        if (!allowedExtensions.includes(fileExt)) {
+            await fs.remove(req.file.path);
+            return res.status(400).json({ error: 'Invalid file type' });
+        }
+
+        const targetDir = path.join(__dirname, 'public/deployments');
+        await fs.ensureDir(targetDir);
+        
+        const targetPath = path.join(targetDir, req.file.originalname);
         await fs.move(req.file.path, targetPath);
         
-        // Add your deployment logic here
         res.json({ 
             status: 'success',
             message: 'Deployment started',
-            file: req.file.originalname
+            file: req.file.originalname,
+            size: req.file.size
         });
     } catch (err) {
         console.error('Deployment error:', err);
+        
+        // Cleanup failed upload
+        if (req.file && req.file.path) {
+            await fs.remove(req.file.path).catch(e => console.error('Cleanup error:', e));
+        }
+        
         res.status(500).json({ 
             error: 'Deployment failed',
             details: err.message
@@ -277,32 +389,57 @@ app.post('/deploy', authenticate, upload.single('website'), async (req, res) => 
     }
 });
 
-// Docker API endpoints
+// Docker API endpoints with timeout
 app.get('/api/containers', authenticate, async (req, res) => {
     try {
-        const containers = await docker.listContainers({ all: true });
+        const containers = await Promise.race([
+            docker.listContainers({ all: true }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout')), 5000))
+        ]);
         res.json(containers);
     } catch (err) {
         console.error('Container list error:', err);
-        res.status(500).json({ error: 'Failed to list containers' });
+        res.status(500).json({ error: err.message });
     }
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-    console.error('Application error:', err);
-    res.status(500).send('Internal Server Error');
+    console.error('Application error:', err.stack);
+    res.status(500).json({ error: 'Internal Server Error' });
 });
 
-// Start server
-const PORT = process.env.WEB_PORT || 3000;
+// Start server with port validation
+const PORT = parseInt(process.env.WEB_PORT) || 3000;
+if (isNaN(PORT) {
+    console.error('Invalid port number');
+    process.exit(1);
+}
+
 app.listen(PORT, () => {
     console.log(\`Server running on port \${PORT}\`);
     console.log(\`Access at: http://localhost:\${PORT}\`);
+}).on('error', (err) => {
+    console.error('Server startup error:', err);
+    process.exit(1);
 });
 EOL
 
-    # Frontend views
+    [ -s "webapp/server.js" ] || {
+        log "ERROR" "Failed to create server.js"
+        emergency_cleanup
+    }
+
+    # Generate frontend files
+    generate_frontend_files
+    
+    log "INFO" "Web application setup completed"
+    return 0
+}
+
+generate_frontend_files() {
+    # Generate index.ejs
     cat > webapp/views/index.ejs <<EOL
 <!DOCTYPE html>
 <html lang="en">
@@ -314,30 +451,44 @@ EOL
 </head>
 <body>
     <div class="container">
-        <header>
+        <header class="header">
             <h1>Auto-Deploy Web Interface</h1>
-            <p>Server: <%= ip %></p>
+            <div class="server-info">
+                <span class="info-label">Server:</span>
+                <span class="info-value"><%= ip %></span>
+                <span class="info-label">Version:</span>
+                <span class="info-value"><%= version %></span>
+            </div>
         </header>
         
         <section class="deploy-section">
             <h2>Website Deployment</h2>
-            <form id="deployForm" enctype="multipart/form-data">
+            <form id="deployForm" class="deploy-form" enctype="multipart/form-data">
                 <div class="form-group">
-                    <label for="website">Select file to deploy:</label>
-                    <input type="file" id="website" name="website" required>
+                    <label for="website">Select deployment package:</label>
+                    <input type="file" id="website" name="website" accept=".zip,.tar,.gz" required>
+                    <div class="file-info" id="fileInfo"></div>
                 </div>
-                <button type="submit">Deploy</button>
-                <div id="deployStatus"></div>
+                <button type="submit" class="btn btn-primary" id="deployButton">
+                    <span class="btn-text">Deploy</span>
+                    <span class="spinner hidden" id="spinner"></span>
+                </button>
+                <div class="status-message" id="deployStatus"></div>
             </form>
         </section>
         
         <section class="docker-section">
-            <h2>Container Management</h2>
-            <div class="container-controls">
-                <button id="refreshContainers">Refresh</button>
+            <div class="section-header">
+                <h2>Container Management</h2>
+                <button class="btn btn-secondary" id="refreshContainers">
+                    <i class="refresh-icon">↻</i> Refresh
+                </button>
             </div>
-            <div id="containersList">
-                <p>Loading containers...</p>
+            <div class="container-list" id="containersList">
+                <div class="loading-state">
+                    <div class="spinner"></div>
+                    <p>Loading containers...</p>
+                </div>
             </div>
         </section>
     </div>
@@ -347,7 +498,7 @@ EOL
 </html>
 EOL
 
-    # CSS styling
+    # Generate CSS
     cat > webapp/public/css/style.css <<EOL
 :root {
     --primary-color: #4285f4;
@@ -356,20 +507,23 @@ EOL
     --warning-color: #fbbc05;
     --text-color: #333;
     --light-gray: #f5f5f5;
+    --dark-gray: #333;
     --border-radius: 4px;
+    --box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    --transition: all 0.3s ease;
 }
 
 * {
     box-sizing: border-box;
     margin: 0;
     padding: 0;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
 }
 
 body {
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    line-height: 1.6;
+    background-color: #f9f9f9;
     color: var(--text-color);
-    background-color: var(--light-gray);
+    line-height: 1.6;
     padding: 20px;
 }
 
@@ -379,56 +533,149 @@ body {
     background: white;
     padding: 30px;
     border-radius: var(--border-radius);
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--box-shadow);
 }
 
-header {
+.header {
     margin-bottom: 30px;
     padding-bottom: 15px;
     border-bottom: 1px solid #eee;
 }
 
-h1, h2 {
-    color: var(--primary-color);
-    margin-bottom: 15px;
+.server-info {
+    display: flex;
+    gap: 20px;
+    margin-top: 10px;
+    font-size: 0.9rem;
+    color: #666;
+}
+
+.info-label {
+    font-weight: 600;
+}
+
+.info-value {
+    font-family: monospace;
+}
+
+.deploy-form {
+    margin-top: 20px;
 }
 
 .form-group {
-    margin-bottom: 15px;
+    margin-bottom: 20px;
 }
 
 label {
     display: block;
-    margin-bottom: 5px;
+    margin-bottom: 8px;
     font-weight: 600;
 }
 
 input[type="file"] {
-    display: block;
-    width: 100%;
-    padding: 10px;
-    border: 1px solid #ddd;
-    border-radius: var(--border-radius);
-    margin-bottom: 10px;
+    display: none;
 }
 
-button {
+.file-info {
+    margin-top: 10px;
+    padding: 10px;
+    border: 1px dashed #ddd;
+    border-radius: var(--border-radius);
+    background-color: var(--light-gray);
+}
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 10px 20px;
+    border: none;
+    border-radius: var(--border-radius);
+    font-size: 16px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.btn-primary {
     background-color: var(--primary-color);
     color: white;
-    border: none;
-    padding: 10px 20px;
-    border-radius: var(--border-radius);
-    cursor: pointer;
-    font-size: 16px;
-    transition: background-color 0.3s;
 }
 
-button:hover {
+.btn-primary:hover {
     background-color: #3367d6;
 }
 
-#containersList {
+.btn-secondary {
+    background-color: var(--light-gray);
+    color: var(--text-color);
+}
+
+.btn-secondary:hover {
+    background-color: #e0e0e0;
+}
+
+.spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 3px solid rgba(255, 255, 255, 0.3);
+    border-radius: 50%;
+    border-top-color: white;
+    animation: spin 1s ease-in-out infinite;
+    margin-left: 10px;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.hidden {
+    display: none;
+}
+
+.status-message {
+    margin-top: 15px;
+    padding: 12px;
+    border-radius: var(--border-radius);
+}
+
+.success-message {
+    background-color: rgba(52, 168, 83, 0.1);
+    color: var(--secondary-color);
+    border: 1px solid var(--secondary-color);
+}
+
+.error-message {
+    background-color: rgba(234, 67, 53, 0.1);
+    color: var(--error-color);
+    border: 1px solid var(--error-color);
+}
+
+.section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+
+.container-list {
     margin-top: 20px;
+}
+
+.loading-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 30px;
+}
+
+.loading-state .spinner {
+    width: 40px;
+    height: 40px;
+    border-width: 4px;
+    margin-bottom: 15px;
 }
 
 table {
@@ -460,44 +707,74 @@ tr:hover {
     color: var(--error-color);
 }
 
-#deployStatus {
-    margin-top: 15px;
-    padding: 10px;
-    border-radius: var(--border-radius);
+.action-btn {
+    padding: 5px 10px;
+    font-size: 14px;
+    margin-right: 5px;
 }
 
-.success-message {
-    background-color: rgba(52, 168, 83, 0.1);
-    color: var(--secondary-color);
-    border: 1px solid var(--secondary-color);
+.refresh-icon {
+    margin-right: 5px;
 }
 
-.error-message {
-    background-color: rgba(234, 67, 53, 0.1);
-    color: var(--error-color);
-    border: 1px solid var(--error-color);
+@media (max-width: 768px) {
+    .container {
+        padding: 15px;
+    }
+    
+    .server-info {
+        flex-direction: column;
+        gap: 5px;
+    }
+    
+    th, td {
+        padding: 8px 10px;
+    }
 }
 EOL
 
-    # JavaScript with enhanced error handling
+    # Generate JavaScript
     cat > webapp/public/js/app.js <<EOL
 document.addEventListener('DOMContentLoaded', () => {
     // DOM elements
     const deployForm = document.getElementById('deployForm');
+    const fileInput = document.getElementById('website');
+    const fileInfo = document.getElementById('fileInfo');
+    const deployButton = document.getElementById('deployButton');
+    const btnText = document.querySelector('.btn-text');
+    const spinner = document.getElementById('spinner');
     const deployStatus = document.getElementById('deployStatus');
     const containersList = document.getElementById('containersList');
     const refreshBtn = document.getElementById('refreshContainers');
     
-    // Load containers on page load
-    loadContainers();
+    // File input handler
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length > 0) {
+            const file = e.target.files[0];
+            fileInfo.innerHTML = \`
+                <strong>Selected file:</strong> \${file.name}<br>
+                <strong>Size:</strong> \${formatFileSize(file.size)}
+            \`;
+        } else {
+            fileInfo.innerHTML = 'No file selected';
+        }
+    });
     
-    // Setup form submission
+    // Form submission handler
     deployForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         
         const formData = new FormData(deployForm);
-        deployStatus.textContent = 'Uploading...';
-        deployStatus.className = '';
+        if (!formData.get('website')) {
+            showStatus('Please select a file first', 'error');
+            return;
+        }
+        
+        // UI updates
+        btnText.textContent = 'Deploying...';
+        spinner.classList.remove('hidden');
+        deployButton.disabled = true;
+        showStatus('Uploading file...', 'info');
         
         try {
             const response = await fetch('/deploy', {
@@ -511,24 +788,60 @@ document.addEventListener('DOMContentLoaded', () => {
             const result = await response.json();
             
             if (response.ok) {
-                deployStatus.textContent = 'Success: ' + result.message;
-                deployStatus.className = 'success-message';
+                showStatus(\`Success: \${result.message}\`, 'success');
+                fileInput.value = '';
+                fileInfo.innerHTML = '';
             } else {
                 throw new Error(result.error || 'Deployment failed');
             }
         } catch (error) {
             console.error('Deployment error:', error);
-            deployStatus.textContent = 'Error: ' + error.message;
-            deployStatus.className = 'error-message';
+            showStatus(\`Error: \${error.message}\`, 'error');
+        } finally {
+            btnText.textContent = 'Deploy';
+            spinner.classList.add('hidden');
+            deployButton.disabled = false;
         }
     });
     
-    // Setup refresh button
+    // Load containers on page load
+    loadContainers();
+    
+    // Refresh button handler
     refreshBtn.addEventListener('click', loadContainers);
     
-    // Container management functions
+    // Helper functions
+    function formatFileSize(bytes) {
+        if (bytes === 0) return '0 Bytes';
+        const k = 1024;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+    
+    function showStatus(message, type) {
+        deployStatus.textContent = message;
+        deployStatus.className = 'status-message';
+        
+        switch (type) {
+            case 'success':
+                deployStatus.classList.add('success-message');
+                break;
+            case 'error':
+                deployStatus.classList.add('error-message');
+                break;
+            default:
+                deployStatus.style.color = 'inherit';
+        }
+    }
+    
     async function loadContainers() {
-        containersList.innerHTML = '<p>Loading containers...</p>';
+        containersList.innerHTML = \`
+            <div class="loading-state">
+                <div class="spinner"></div>
+                <p>Loading containers...</p>
+            </div>
+        \`;
         
         try {
             const response = await fetch('/api/containers', {
@@ -537,11 +850,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             });
             
-            const containers = await response.json();
-            
             if (!response.ok) {
-                throw new Error(containers.error || 'Failed to load containers');
+                const error = await response.json();
+                throw new Error(error.error || 'Failed to load containers');
             }
+            
+            const containers = await response.json();
             
             if (containers.length === 0) {
                 containersList.innerHTML = '<p>No containers running</p>';
@@ -549,33 +863,37 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             
             containersList.innerHTML = \`
-                <table>
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>Name</th>
-                            <th>Image</th>
-                            <th>Status</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        \${containers.map(container => \`
+                <div class="table-responsive">
+                    <table>
+                        <thead>
                             <tr>
-                                <td>\${container.Id.substring(0, 12)}</td>
-                                <td>\${container.Names[0].replace('/', '')}</td>
-                                <td>\${container.Image}</td>
-                                <td class="status-\${container.State.toLowerCase()}">\${container.State}</td>
-                                <td>
-                                    \${container.State === 'running' 
-                                        ? '<button onclick="stopContainer(\`\${container.Id}\`)">Stop</button>'
-                                        : '<button onclick="startContainer(\`\${container.Id}\`)">Start</button>'
-                                    }
-                                </td>
+                                <th>ID</th>
+                                <th>Name</th>
+                                <th>Image</th>
+                                <th>Status</th>
+                                <th>Actions</th>
                             </tr>
-                        \`).join('')}
-                    </tbody>
-                </table>
+                        </thead>
+                        <tbody>
+                            \${containers.map(container => \`
+                                <tr>
+                                    <td>\${container.Id.substring(0, 12)}</td>
+                                    <td>\${container.Names[0].replace('/', '')}</td>
+                                    <td>\${container.Image}</td>
+                                    <td class="status-\${container.State.toLowerCase()}">
+                                        \${container.State}
+                                    </td>
+                                    <td>
+                                        \${container.State === 'running' 
+                                            ? '<button class="action-btn" onclick="stopContainer(\`\${container.Id}\`)">Stop</button>'
+                                            : '<button class="action-btn" onclick="startContainer(\`\${container.Id}\`)">Start</button>'
+                                        }
+                                    </td>
+                                </tr>
+                            \`).join('')}
+                        </tbody>
+                    </table>
+                </div>
             \`;
         } catch (error) {
             console.error('Error loading containers:', error);
@@ -633,36 +951,51 @@ async function stopContainer(containerId) {
     }
 }
 EOL
-
-    log "INFO" "Web application setup completed"
 }
 
 setup_docker() {
-    log "INFO" "Configuring Docker..."
+    log "INFO" "Configuring Docker environment..."
     
-    create_backup "/etc/docker/daemon.json" || {
-        log "WARN" "Could not backup Docker config"
+    create_backup "/etc/docker" || {
+        log "WARN" "Could not backup Docker configuration"
     }
     
-    # Dockerfile
+    # Generate Dockerfile with health checks
     cat > Dockerfile <<EOL
 FROM ${DOCKER_NODE_IMAGE}
 WORKDIR /app
+
+# Install curl for health checks
+RUN apk add --no-cache curl
+
 COPY webapp/package*.json ./
-RUN npm install --production --no-optional
+RUN npm install --production --no-optional --quiet
+
 COPY webapp .
-EXPOSE ${WEB_PORT}
+
+# Health check with timeout
 HEALTHCHECK --interval=30s --timeout=3s \\
-    CMD curl -f http://localhost:${WEB_PORT}/ || exit 1
+    CMD curl -f http://localhost:${WEB_PORT}/health || exit 1
+
+EXPOSE ${WEB_PORT}
+USER node
 CMD ["node", "server.js"]
 EOL
 
-    # docker-compose.yml with resource limits
+    [ -s "Dockerfile" ] || {
+        log "ERROR" "Failed to create Dockerfile"
+        emergency_cleanup
+    }
+
+    # Generate docker-compose.yml with resource limits
     cat > docker-compose.yml <<EOL
 version: '3.8'
+
 services:
   webapp:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: auto-deploy-web
     restart: unless-stopped
     ports:
@@ -685,15 +1018,27 @@ services:
           memory: 512M
         reservations:
           memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${WEB_PORT}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 networks:
   deploy-network:
     driver: bridge
+    name: auto-deploy-network
 EOL
 
-    # Control script with enhanced functionality
+    [ -s "docker-compose.yml" ] || {
+        log "ERROR" "Failed to create docker-compose.yml"
+        emergency_cleanup
+    }
+
+    # Generate control script with backup functionality
     cat > docker.sh <<EOL
 #!/bin/bash
+
 ACTION=\$1
 ENV_FILE=".env"
 
@@ -702,36 +1047,61 @@ if [ -f "\$ENV_FILE" ]; then
     export \$(grep -v '^#' \$ENV_FILE | xargs)
 fi
 
+# Docker compose command with buildx if available
+DOCKER_COMPOSE_CMD="docker-compose"
+if command -v docker-compose &> /dev/null; then
+    DOCKER_COMPOSE_CMD="docker-compose"
+elif docker compose version &> /dev/null; then
+    DOCKER_COMPOSE_CMD="docker compose"
+else
+    echo "Error: No docker-compose command found"
+    exit 1
+fi
+
 case \$ACTION in
     start)
-        docker-compose up -d --build
+        \$DOCKER_COMPOSE_CMD up -d --build
         ;;
     stop)
-        docker-compose down
+        \$DOCKER_COMPOSE_CMD down
         ;;
     restart)
-        docker-compose restart
+        \$DOCKER_COMPOSE_CMD restart
         ;;
     status)
         echo "=== Docker Containers ==="
-        docker-compose ps
+        \$DOCKER_COMPOSE_CMD ps
         echo "=== System Resources ==="
         docker stats --no-stream
+        echo "=== Health Status ==="
+        \$DOCKER_COMPOSE_CMD ps | awk 'NR>1 {print \$1}' | xargs -I {} docker inspect --format '{{.Name}} - {{.State.Health.Status}}' {}
         ;;
     logs)
-        docker-compose logs -f --tail=100
+        \$DOCKER_COMPOSE_CMD logs -f --tail=100
         ;;
     update)
         git pull origin master
-        docker-compose build --no-cache
-        docker-compose up -d
+        \$DOCKER_COMPOSE_CMD build --no-cache
+        \$DOCKER_COMPOSE_CMD up -d
         ;;
     backup)
-        BACKUP_DIR="backups/\$(date +%Y%m%d%H%M%S)"
+        TIMESTAMP=\$(date +%Y%m%d%H%M%S)
+        BACKUP_DIR="backups/\$TIMESTAMP"
         mkdir -p "\$BACKUP_DIR"
-        docker-compose exec webapp tar czf /tmp/backup.tar.gz /app
-        docker cp \$(docker-compose ps -q webapp):/tmp/backup.tar.gz "\$BACKUP_DIR/backup.tar.gz"
-        echo "Backup created in \$BACKUP_DIR/backup.tar.gz"
+        
+        # Backup application data
+        \$DOCKER_COMPOSE_CMD exec -T webapp tar czf /tmp/app_backup.tar.gz /app
+        docker cp \$(\$DOCKER_COMPOSE_CMD ps -q webapp):/tmp/app_backup.tar.gz "\$BACKUP_DIR/app_backup.tar.gz"
+        
+        # Backup database if exists
+        if \$DOCKER_COMPOSE_CMD ps -q db &> /dev/null; then
+            \$DOCKER_COMPOSE_CMD exec -T db sh -c 'mysqldump -u\$MYSQL_USER -p\$MYSQL_PASSWORD \$MYSQL_DATABASE' > "\$BACKUP_DIR/db_backup.sql"
+        fi
+        
+        # Backup configuration
+        tar czf "\$BACKUP_DIR/config_backup.tar.gz" .env docker-compose.yml
+        
+        echo "Backup created in \$BACKUP_DIR"
         ;;
     *)
         echo "Usage: \$0 {start|stop|restart|status|logs|update|backup}"
@@ -740,24 +1110,30 @@ case \$ACTION in
 esac
 EOL
 
-    chmod +x docker.sh
+    chmod +x docker.sh || {
+        log "ERROR" "Failed to make docker.sh executable"
+        emergency_cleanup
+    }
+
     log "INFO" "Docker configuration completed"
+    return 0
 }
 
 setup_nginx() {
     log "INFO" "Configuring Nginx reverse proxy..."
     
     create_backup "/etc/nginx" || {
-        log "WARN" "Could not backup Nginx config"
+        log "ERROR" "Failed to backup Nginx configuration"
+        emergency_cleanup
     }
     
-    # Create Nginx config with multiple optimizations
+    # Generate Nginx configuration with multiple optimizations
     cat > /etc/nginx/sites-available/${DEFAULT_DOMAIN} <<EOL
 # HTTP to HTTPS redirect
 server {
-    listen ${NGINX_PORT};
-    listen [::]:${NGINX_PORT};
-    server_name ${DEFAULT_DOMAIN} www.${DEFAULT_DOMAIN};
+    listen ${NGINX_PORT} default_server;
+    listen [::]:${NGINX_PORT} default_server;
+    server_name _;
     return 301 https://\$host\$request_uri;
 }
 
@@ -767,7 +1143,7 @@ server {
     listen [::]:${NGINX_SSL_PORT} ssl http2;
     server_name ${DEFAULT_DOMAIN} www.${DEFAULT_DOMAIN};
 
-    # SSL Configuration
+    # SSL Configuration - Will be managed by Certbot
     ssl_certificate /etc/letsencrypt/live/${DEFAULT_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DEFAULT_DOMAIN}/privkey.pem;
     ssl_trusted_certificate /etc/letsencrypt/live/${DEFAULT_DOMAIN}/chain.pem;
@@ -781,12 +1157,14 @@ server {
     ssl_session_tickets off;
     ssl_stapling on;
     ssl_stapling_verify on;
+    ssl_dhparam /etc/nginx/dhparam.pem;
     
     # Security Headers
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';" always;
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     
     # Proxy configuration
     location / {
@@ -807,46 +1185,68 @@ server {
     }
     
     # Static file caching
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)\$ {
+    location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg)\$ {
         expires 30d;
         add_header Cache-Control "public, no-transform";
         try_files \$uri \$uri/ =404;
     }
     
     # Disable access to hidden files
-    location ~ /\. {
+    location ~ /\\. {
         deny all;
         access_log off;
         log_not_found off;
     }
     
     # Error pages
+    error_page 400 401 402 403 404 405 /40x.html;
     error_page 500 502 503 504 /50x.html;
+    
+    location = /40x.html {
+        root /usr/share/nginx/html;
+        internal;
+    }
+    
     location = /50x.html {
         root /usr/share/nginx/html;
+        internal;
     }
+    
+    # Logging
+    access_log /var/log/nginx/${DEFAULT_DOMAIN}_access.log;
+    error_log /var/log/nginx/${DEFAULT_DOMAIN}_error.log;
 }
 EOL
 
     # Enable site
     ln -sf "/etc/nginx/sites-available/${DEFAULT_DOMAIN}" "/etc/nginx/sites-enabled/" || {
         log "ERROR" "Failed to enable Nginx site"
-        return 1
+        emergency_cleanup
     }
+    
+    # Remove default config if exists
+    [ -f "/etc/nginx/sites-enabled/default" ] && rm -f "/etc/nginx/sites-enabled/default"
+    
+    # Generate DH parameters (background process)
+    if [ ! -f "/etc/nginx/dhparam.pem" ]; then
+        log "INFO" "Generating DH parameters (this may take several minutes)..."
+        openssl dhparam -out /etc/nginx/dhparam.pem 2048 &> /dev/null &
+    fi
     
     # Test configuration
     if ! nginx -t; then
         log "ERROR" "Nginx configuration test failed"
-        return 1
+        emergency_cleanup
     fi
     
     # Restart Nginx
     systemctl restart nginx || {
         log "ERROR" "Failed to restart Nginx"
-        return 1
+        emergency_cleanup
     }
     
     log "INFO" "Nginx configuration completed"
+    return 0
 }
 
 setup_ssl() {
@@ -866,19 +1266,35 @@ setup_ssl() {
         log "WARN" "Could not stop Nginx, attempting SSL setup anyway"
     }
     
-    # Obtain certificate
-    if certbot certonly --standalone \
-        -d "${DEFAULT_DOMAIN}" \
-        -d "www.${DEFAULT_DOMAIN}" \
+    # Obtain certificate with multiple fallbacks
+    local certbot_cmd="certbot certonly --standalone \
+        -d ${DEFAULT_DOMAIN} \
+        -d www.${DEFAULT_DOMAIN} \
         --non-interactive \
         --agree-tos \
-        --email "admin@${DEFAULT_DOMAIN}" \
-        --preferred-challenges http; then
+        --email admin@${DEFAULT_DOMAIN} \
+        --preferred-challenges http \
+        --keep-until-expiring"
+    
+    if ! retry_command "$certbot_cmd" "Obtain SSL certificate" 3 10; then
+        log "WARN" "Standard certbot failed, trying alternative methods..."
         
-        log "INFO" "SSL certificate obtained successfully"
-    else
-        log "ERROR" "Failed to obtain SSL certificate"
-        return 1
+        # Try with DNS challenge if HTTP fails
+        if certbot certonly --manual \
+            -d ${DEFAULT_DOMAIN} \
+            -d www.${DEFAULT_DOMAIN} \
+            --non-interactive \
+            --agree-tos \
+            --email admin@${DEFAULT_DOMAIN} \
+            --preferred-challenges dns \
+            --manual-public-ip-logging-ok; then
+            
+            log "INFO" "SSL certificate obtained via DNS challenge"
+        else
+            log "ERROR" "All SSL certificate acquisition methods failed"
+            systemctl start nginx || true
+            return 1
+        fi
     fi
     
     # Restart Nginx
@@ -887,12 +1303,13 @@ setup_ssl() {
         return 1
     }
     
-    # Setup auto-renewal
-    (crontab -l 2>/dev/null; echo "0 3 * * * /usr/bin/certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab - || {
+    # Setup auto-renewal with pre and post hooks
+    (crontab -l 2>/dev/null; echo "0 3 * * * /usr/bin/certbot renew --quiet --pre-hook 'systemctl stop nginx' --post-hook 'systemctl start nginx'") | crontab - || {
         log "WARN" "Could not setup SSL auto-renewal"
     }
     
     log "INFO" "SSL setup completed"
+    return 0
 }
 
 setup_firewall() {
@@ -916,6 +1333,7 @@ setup_firewall() {
     }
     
     log "INFO" "Firewall configuration completed"
+    return 0
 }
 
 system_optimization() {
@@ -958,6 +1376,7 @@ EOL
     }
     
     log "INFO" "System optimization completed"
+    return 0
 }
 
 # --------------------------
@@ -988,21 +1407,26 @@ main() {
     
     for step in "${setup_steps[@]}"; do
         if ! $step; then
-            log "WARN" "Step ${step} encountered errors - continuing with setup"
+            log "WARN" "Step ${step} encountered errors - attempting to continue"
         fi
     done
     
     # Final status
-    log "INFO" "Setup completed with status:"
-    echo "----------------------------------------"
-    echo " Web Application URL: http://${CURRENT_IP}:${WEB_PORT}"
-    echo " Admin Credentials: ${ADMIN_USER}/${ADMIN_PASS}"
-    echo " Control Script: ./docker.sh {start|stop|restart|status|logs}"
-    echo "----------------------------------------"
+    echo -e "\n${GREEN}=== Setup Completed ===${NC}"
+    echo -e "Web Application URL: ${BLUE}http://${CURRENT_IP}:${WEB_PORT}${NC}"
+    echo -e "Admin Credentials: ${YELLOW}${ADMIN_USER}/${ADMIN_PASS}${NC}"
+    echo -e "Control Script: ${CYAN}./docker.sh {start|stop|restart|status|logs|update|backup}${NC}"
+    echo -e "Log File: ${MAGENTA}${LOG_FILE}${NC}"
+    echo -e "Backup Directory: ${MAGENTA}${BACKUP_DIR}${NC}"
+    echo -e "\nNext Steps:"
+    echo -e "1. Configure DNS for ${DEFAULT_DOMAIN} to point to ${CURRENT_IP}"
+    echo -e "2. Run ${CYAN}./docker.sh start${NC} to launch the application"
+    echo -e "3. Monitor logs with ${CYAN}./docker.sh logs${NC}"
     
     # Start services
     ./docker.sh start
 }
 
-# Start main execution
+# Start main execution with error trapping
+trap emergency_cleanup SIGINT SIGTERM ERR
 main
